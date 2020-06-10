@@ -1,9 +1,9 @@
-import 'reflect-metadata'
 import { createConnection, getConnection, getManager, EntitySchema } from 'typeorm'
 import { createHash } from 'crypto'
 
 import { CreateUserError } from '../../lib/errors'
 import Models from './models'
+import logger from '../../lib/logger'
 
 const Adapter = (config, options = {}) => {
   // If the input is URL string, automatically convert the string to an object
@@ -42,11 +42,11 @@ const Adapter = (config, options = {}) => {
   }
 
   // Load models / schemas (check for custom models / schemas first)
-  const Account = options.Account ? options.Account.model : Models.Account.model
-  const AccountSchema = options.Account ? options.Account.schema : Models.Account.schema
-
   const User = options.User ? options.User.model : Models.User.model
   const UserSchema = options.User ? options.User.schema : Models.User.schema
+
+  const Account = options.Account ? options.Account.model : Models.Account.model
+  const AccountSchema = options.Account ? options.Account.schema : Models.Account.schema
 
   const Session = options.Session ? options.Session.model : Models.Session.model
   const SessionSchema = options.Session ? options.Session.schema : Models.Session.schema
@@ -78,9 +78,9 @@ const Adapter = (config, options = {}) => {
     //
     // @TODO Look at refactoring to see if there is a better way to do this that
     // doesn't rely on hard coding this transformation on a per property basis
+    UserSchema.columns.id.objectId = true
     AccountSchema.columns.id.objectId = true
     AccountSchema.columns.userId.type = 'objectId'
-    UserSchema.columns.id.objectId = true
     SessionSchema.columns.id.objectId = true
     SessionSchema.columns.userId.type = 'objectId'
     VerificationRequestSchema.columns.id.objectId = true
@@ -92,9 +92,13 @@ const Adapter = (config, options = {}) => {
   // @TODO Refactor to apply automatically to all `timestamp` properties if the
   // database is MySQL.
   if (config.type === 'sqlite') {
+    UserSchema.columns.created.type = 'datetime'
     AccountSchema.columns.accessTokenExpires.type = 'datetime'
-    SessionSchema.columns.sessionExpires.type = 'datetime'
+    AccountSchema.columns.created.type = 'datetime'
+    SessionSchema.columns.expires.type = 'datetime'
+    SessionSchema.columns.created.type = 'datetime'
     VerificationRequestSchema.columns.expires.type = 'datetime'
+    VerificationRequestSchema.columns.created.type = 'datetime'
   }
 
   // Parse config (uses options)
@@ -102,8 +106,8 @@ const Adapter = (config, options = {}) => {
     name: 'default',
     autoLoadEntities: true,
     entities: [
-      new EntitySchema(AccountSchema),
       new EntitySchema(UserSchema),
+      new EntitySchema(AccountSchema),
       new EntitySchema(SessionSchema),
       new EntitySchema(VerificationRequestSchema)
     ],
@@ -138,7 +142,7 @@ const Adapter = (config, options = {}) => {
           // been re-established, check it's really up
           await _connect()
         } else {
-          console.error('ADAPTER_CONNECTION_ERROR', error)
+          logger.error('ADAPTER_CONNECTION_ERROR', error)
         }
       }
     } else {
@@ -147,9 +151,10 @@ const Adapter = (config, options = {}) => {
     }
 
     // Display debug output if debug option enabled
-    function _debug (...args) {
+    // @TODO Refactor logger so is passed in appOptions
+    function _debug (debugCode, ...args) {
       if (appOptions.debug) {
-        console.log('[NextAuth.js][DEBUG]', ...args)
+        logger.debug(debugCode, ...args)
       }
     }
 
@@ -164,6 +169,9 @@ const Adapter = (config, options = {}) => {
       ObjectId = mongodb.ObjectId
     }
 
+    const sessionMaxAge = appOptions.session.maxAge * 1000
+    const sessionUpdateAge = appOptions.session.updateAge * 1000
+
     async function createUser (profile) {
       _debug('createUser', profile)
       try {
@@ -171,7 +179,7 @@ const Adapter = (config, options = {}) => {
         const user = new User(profile.name, profile.email, profile.image)
         return await getManager().save(user)
       } catch (error) {
-        console.error('CREATE_USER_ERROR', error)
+        logger.error('CREATE_USER_ERROR', error)
         return Promise.reject(new CreateUserError(error))
       }
     }
@@ -184,7 +192,7 @@ const Adapter = (config, options = {}) => {
       // an ObjectId and we need to turn it into an ObjectId.
       //
       // In all other scenarios it is already an ObjectId, because it will have
-      // come from another MongoDB query. 
+      // come from another MongoDB query.
       if (ObjectId && !(id instanceof ObjectId)) {
         id = ObjectId(id)
       }
@@ -192,7 +200,7 @@ const Adapter = (config, options = {}) => {
       try {
         return connection.getRepository(User).findOne({ [idKey]: id })
       } catch (error) {
-        console.error('GET_USER_BY_ID_ERROR', error)
+        logger.error('GET_USER_BY_ID_ERROR', error)
         return Promise.reject(new Error('GET_USER_BY_ID_ERROR', error))
       }
     }
@@ -202,7 +210,7 @@ const Adapter = (config, options = {}) => {
       try {
         return connection.getRepository(User).findOne({ email })
       } catch (error) {
-        console.error('GET_USER_BY_EMAIL_ERROR', error)
+        logger.error('GET_USER_BY_EMAIL_ERROR', error)
         return Promise.reject(new Error('GET_USER_BY_EMAIL_ERROR', error))
       }
     }
@@ -214,7 +222,7 @@ const Adapter = (config, options = {}) => {
         if (!account) { return null }
         return connection.getRepository(User).findOne({ [idKey]: account.userId })
       } catch (error) {
-        console.error('GET_USER_BY_PROVIDER_ACCOUNT_ID_ERROR', error)
+        logger.error('GET_USER_BY_PROVIDER_ACCOUNT_ID_ERROR', error)
         return Promise.reject(new Error('GET_USER_BY_PROVIDER_ACCOUNT_ID_ERROR', error))
       }
     }
@@ -244,7 +252,7 @@ const Adapter = (config, options = {}) => {
         const account = new Account(userId, providerId, providerType, providerAccountId, refreshToken, accessToken, accessTokenExpires)
         return getManager().save(account)
       } catch (error) {
-        console.error('LINK_ACCOUNT_ERROR', error)
+        logger.error('LINK_ACCOUNT_ERROR', error)
         return Promise.reject(new Error('LINK_ACCOUNT_ERROR', error))
       }
     }
@@ -260,7 +268,6 @@ const Adapter = (config, options = {}) => {
     async function createSession (user) {
       _debug('createSession', user)
       try {
-        const { sessionMaxAge } = appOptions
         let expires = null
         if (sessionMaxAge) {
           const dateExpires = new Date()
@@ -268,11 +275,11 @@ const Adapter = (config, options = {}) => {
           expires = dateExpires.toISOString()
         }
 
-        const session = new Session(user.id, null, expires)
+        const session = new Session(user.id, expires)
 
         return getManager().save(session)
       } catch (error) {
-        console.error('CREATE_SESSION_ERROR', error)
+        logger.error('CREATE_SESSION_ERROR', error)
         return Promise.reject(new Error('CREATE_SESSION_ERROR', error))
       }
     }
@@ -283,14 +290,14 @@ const Adapter = (config, options = {}) => {
         const session = await connection.getRepository(Session).findOne({ sessionToken })
 
         // Check session has not expired (do not return it if it has)
-        if (session && session.sessionExpires && new Date() > new Date(session.sessionExpires)) {
+        if (session && session.expires && new Date() > new Date(session.expires)) {
           // @TODO Delete old sessions from database
           return null
         }
 
         return session
       } catch (error) {
-        console.error('GET_SESSION_ERROR', error)
+        logger.error('GET_SESSION_ERROR', error)
         return Promise.reject(new Error('GET_SESSION_ERROR', error))
       }
     }
@@ -298,16 +305,14 @@ const Adapter = (config, options = {}) => {
     async function updateSession (session, force) {
       _debug('updateSession', session)
       try {
-        const { sessionMaxAge, sessionUpdateAge } = appOptions
-
-        if (sessionMaxAge && (sessionUpdateAge || sessionUpdateAge === 0) && session.sessionExpires) {
+        if (sessionMaxAge && (sessionUpdateAge || sessionUpdateAge === 0) && session.expires) {
           // Calculate last updated date, to throttle write updates to database
           // Formula: ({expiry date} - sessionMaxAge) + sessionUpdateAge
           //     e.g. ({expiry date} - 30 days) + 1 hour
           //
           // Default for sessionMaxAge is 30 days.
           // Default for sessionUpdateAge is 1 hour.
-          const dateSessionIsDueToBeUpdated = new Date(session.sessionExpires)
+          const dateSessionIsDueToBeUpdated = new Date(session.expires)
           dateSessionIsDueToBeUpdated.setTime(dateSessionIsDueToBeUpdated.getTime() - sessionMaxAge)
           dateSessionIsDueToBeUpdated.setTime(dateSessionIsDueToBeUpdated.getTime() + sessionUpdateAge)
 
@@ -316,19 +321,19 @@ const Adapter = (config, options = {}) => {
           if (new Date() > dateSessionIsDueToBeUpdated) {
             const newExpiryDate = new Date()
             newExpiryDate.setTime(newExpiryDate.getTime() + sessionMaxAge)
-            session.sessionExpires = newExpiryDate.toISOString()
+            session.expires = newExpiryDate.toISOString()
           } else if (!force) {
             return null
           }
         } else {
-          // If sessionMaxAge, sessionUpdateAge or session.sessionExpires are
+          // If session MaxAge, session UpdateAge or session.expires are
           // missing then don't even try to save changes, unless force is set.
           if (!force) { return null }
         }
 
         return getManager().save(session)
       } catch (error) {
-        console.error('UPDATE_SESSION_ERROR', error)
+        logger.error('UPDATE_SESSION_ERROR', error)
         return Promise.reject(new Error('UPDATE_SESSION_ERROR', error))
       }
     }
@@ -338,7 +343,7 @@ const Adapter = (config, options = {}) => {
       try {
         return await connection.getRepository(Session).delete({ sessionToken })
       } catch (error) {
-        console.error('DELETE_SESSION_ERROR', error)
+        logger.error('DELETE_SESSION_ERROR', error)
         return Promise.reject(new Error('DELETE_SESSION_ERROR', error))
       }
     }
@@ -346,8 +351,8 @@ const Adapter = (config, options = {}) => {
     async function createVerificationRequest (identifer, url, token, secret, provider) {
       _debug('createVerificationRequest', identifer)
       try {
-        const { site, verificationMaxAge } = appOptions
-        const { sendVerificationRequest } = provider
+        const { site } = appOptions
+        const { sendVerificationRequest, maxAge } = provider
 
         // Store hashed token (using secret as salt) so that tokens cannot be exploited
         // even if the contents of the database is compromised.
@@ -355,9 +360,9 @@ const Adapter = (config, options = {}) => {
         const hashedToken = createHash('sha256').update(`${token}${secret}`).digest('hex')
 
         let expires = null
-        if (verificationMaxAge) {
+        if (maxAge) {
           const dateExpires = new Date()
-          dateExpires.setTime(dateExpires.getTime() + verificationMaxAge)
+          dateExpires.setTime(dateExpires.getTime() + (maxAge * 1000))
           expires = dateExpires.toISOString()
         }
 
@@ -371,7 +376,7 @@ const Adapter = (config, options = {}) => {
 
         return verificationRequest
       } catch (error) {
-        console.error('CREATE_VERIFICATION_REQUEST_ERROR', error)
+        logger.error('CREATE_VERIFICATION_REQUEST_ERROR', error)
         return Promise.reject(new Error('CREATE_VERIFICATION_REQUEST_ERROR', error))
       }
     }
@@ -392,7 +397,7 @@ const Adapter = (config, options = {}) => {
 
         return verificationRequest
       } catch (error) {
-        console.error('GET_VERIFICATION_REQUEST_ERROR', error)
+        logger.error('GET_VERIFICATION_REQUEST_ERROR', error)
         return Promise.reject(new Error('GET_VERIFICATION_REQUEST_ERROR', error))
       }
     }
@@ -404,7 +409,7 @@ const Adapter = (config, options = {}) => {
         const hashedToken = createHash('sha256').update(`${token}${secret}`).digest('hex')
         await connection.getRepository(VerificationRequest).delete({ token: hashedToken })
       } catch (error) {
-        console.error('DELETE_VERIFICATION_REQUEST_ERROR', error)
+        logger.error('DELETE_VERIFICATION_REQUEST_ERROR', error)
         return Promise.reject(new Error('DELETE_VERIFICATION_REQUEST_ERROR', error))
       }
     }
