@@ -14,21 +14,24 @@ const DEFAULT_SITE = ''
 const DEFAULT_BASE_PATH = '/api/auth'
 
 // Universal method (client + server)
-const getSession = async ({ req } = {}) => {
+const getSession =  (arg) => {
+  const { req } = arg || {}
   const baseUrl = _baseUrl({ req })
   const options = req ? { headers: { cookie: req.headers.cookie } } : {}
   return _fetchData(`${baseUrl}/session`, options)
 }
 
 // Universal method (client + server)
-const getProviders = async ({ req } = {}) => {
+const getProviders = (arg) => {
+  const { req } = arg || {}
   const baseUrl = _baseUrl({ req })
   const options = req ? { headers: { cookie: req.headers.cookie } } : {}
   return _fetchData(`${baseUrl}/providers`, options)
 }
 
 // Universal method (client + server)
-const getCsrfToken = async ({ req } = {}) => {
+const getCsrfToken = async (arg) => {
+  const { req } = arg || {}
   const baseUrl = _baseUrl({ req })
   const options = req ? { headers: { cookie: req.headers.cookie } } : {}
   const data = await _fetchData(`${baseUrl}/csrf`, options)
