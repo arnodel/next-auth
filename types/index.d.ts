@@ -1,11 +1,9 @@
 // Minimum TypeScript Version: 3.8
 /// <reference types="node" />
-/// <reference types="typeorm" />
-/// <reference types="next" />
-import type { ConnectionOptions } from 'typeorm';
-import type { NextApiRequest, NextApiResponse } from 'next';
+import type { ConnectionOptions } from "typeorm";
 
-export default function NextAuth(req: NextApiRequest, res: NextApiResponse, options?: InitOptions): Promise<void>;
+// TODO: `dtslint` throws when parsing Next types, @see https://github.com/microsoft/dtslint/issues/297
+// import type { NextApiRequest, NextApiResponse } from 'next';
 
 export interface InitOptions {
   site: string;
@@ -49,7 +47,13 @@ export interface Cookie {
 export interface CookieOptions {
   httpOnly?: boolean;
   // TODO: type available `sameSite` identifiers
-  sameSite: 'lax';
+  sameSite: "lax";
   path: string;
   secure: boolean;
 }
+
+export default function NextAuth(
+  req: any,
+  res: any,
+  options?: InitOptions
+): Promise<void>;

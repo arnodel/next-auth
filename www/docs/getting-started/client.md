@@ -11,8 +11,6 @@ Some of the methods can be called both client side and server side.
 When using any of the client API methods server side, [context](https://nextjs.org/docs/api-reference/data-fetching/getInitialProps#context-object) must be passed as an argument. The documentation for **getSession()** has an example.
 :::
 
----
-
 ## useSession()
 
 * Client Side: **Yes**
@@ -149,7 +147,7 @@ You likely only need to use this if you are not using the built-in `signin()` an
 
 ---
 
-## signin(provider, { options })
+## signin()
 
 * Client Side: **Yes**
 * Server Side: No
@@ -185,7 +183,7 @@ When using it with the email flow, pass the target `email` as an option.
 ```js
 import { signin } from 'next-auth/client'
 
-export default (email) => (
+export default ({ email }) => (
   <button onClick={() => signin('email', { email })}>Sign in with Email</button>
 )
 ```
@@ -217,7 +215,7 @@ export default () => (
 
 ## Provider
 
-Using the supplied React `<Provider>` allows instances of `useSession()` to share the session object across components, buy using [React Context](https://reactjs.org/docs/context.html) under the hood.
+Using the supplied React `<Provider>` allows instances of `useSession()` to share the session object across components, by using [React Context](https://reactjs.org/docs/context.html) under the hood.
 
 This improves performance, reduces network calls and avoids page flicker when rendering.
 

@@ -3,8 +3,8 @@ import oAuthCallback from '../lib/oauth/callback'
 import callbackHandler from '../lib/callback-handler'
 import cookie from '../lib/cookie'
 import logger from '../../lib/logger'
+import dispatchEvent from '../lib/dispatch-event'
 
-// @TODO Refactor oAuthCallback to return promise instead of using a callback and reduce duplicate code
 export default async (req, res, options, done) => {
   const {
     provider: providerName,
@@ -17,7 +17,8 @@ export default async (req, res, options, done) => {
     callbackUrl,
     pages,
     jwt,
-    allowSignin
+    events,
+    callbacks
   } = options
   const provider = providers[providerName]
   const { type } = provider
@@ -35,38 +36,39 @@ export default async (req, res, options, done) => {
         res.end()
         return done()
       }
-
-      const { profile, account } = await oauthAccount
-
-      // Check allowSignin() allows this account to sign in
-      if (!await allowSignin(profile, account)) {
-        res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
-        res.end()
-        return done()
-      }
-
       try {
+        const { profile, account, oAuthProfile } = await oauthAccount
+
+        // Check if user is allowed to sign in
+        const signinCallbackResponse = await callbacks.signin(profile, account, oAuthProfile)
+
+        if (signinCallbackResponse === false) {
+          res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
+          res.end()
+          return done()
+        }
+
+        // Sign user in
         const { user, session, isNewUser } = await callbackHandler(sessionToken, profile, account, options)
 
         if (useJwtSession) {
-          const jwtPayload = await jwt.set({
-            user,
-            account,
-            isNewUser
-          })
+          const defaultJwtPayload = { user, account, isNewUser }
+          const jwtPayload = await callbacks.jwt(defaultJwtPayload, oAuthProfile)
 
           // Sign and encrypt token
-          const token = await jwt.encode({ secret: jwt.secret, token: jwtPayload, maxAge: sessionMaxAge })
+          const newEncodedJwt = await jwt.encode({ secret: jwt.secret, token: jwtPayload, maxAge: sessionMaxAge })
 
           // Set cookie expiry date
           const cookieExpires = new Date()
           cookieExpires.setTime(cookieExpires.getTime() + (sessionMaxAge * 1000))
 
-          cookie.set(res, cookies.sessionToken.name, token, { expires: cookieExpires.toISOString(), ...cookies.sessionToken.options })
+          cookie.set(res, cookies.sessionToken.name, newEncodedJwt, { expires: cookieExpires.toISOString(), ...cookies.sessionToken.options })
         } else {
           // Save Session Token in cookie
           cookie.set(res, cookies.sessionToken.name, session.sessionToken, { expires: session.expires || null, ...cookies.sessionToken.options })
         }
+
+        await dispatchEvent(events.signin, { user, account, isNewUser })
 
         // Handle first logins on new accounts
         // e.g. option to send users to a new account landing page on initial login
@@ -79,12 +81,9 @@ export default async (req, res, options, done) => {
       } catch (error) {
         if (error.name === 'AccountNotLinkedError') {
           // If the email on the account is already linked, but nto with this oAuth account
-          res.status(302).setHeader('Location', `${baseUrl}/error?error=oAuthAccountNotLinked`)
+          res.status(302).setHeader('Location', `${baseUrl}/error?error=OAuthAccountNotLinked`)
         } else if (error.name === 'CreateUserError') {
           res.status(302).setHeader('Location', `${baseUrl}/error?error=OAuthCreateAccount`)
-        } else if (error.name === 'InvalidProfile') {
-          // If is missing email address (NB: the only field on a profile currently required)
-          res.status(302).setHeader('Location', `${baseUrl}/error?error=EmailRequired`)
         } else {
           logger.error('OAUTH_CALLBACK_HANDLER_ERROR', error)
           res.status(302).setHeader('Location', `${baseUrl}/error?error=Callback`)
@@ -106,62 +105,62 @@ export default async (req, res, options, done) => {
   } else if (type === 'email') {
     try {
       if (!adapter) {
-        console.error('EMAIL_REQUIRES_ADAPTER_ERROR')
+        logger.error('EMAIL_REQUIRES_ADAPTER_ERROR')
         res.status(302).setHeader('Location', `${baseUrl}/error?error=Configuration`)
         res.end()
         return done()
       }
 
-      const { getVerificationRequest, deleteVerificationRequest } = await adapter.getAdapter(options)
-      const token = req.query.token
-      const email = req.query.email ? req.query.email.toLowerCase() : null
+      const { getVerificationRequest, deleteVerificationRequest, getUserByEmail } = await adapter.getAdapter(options)
+      const verificationToken = req.query.token
+      const email = req.query.email
 
-      // Create the an `account` object with `id` and `type` properties as they
-      // are expected by the `callbackHandler` function and in the JWT.
-      const emailProviderAccount = { id: provider.id, type: 'email' }
-
-      // Check allowSignin() allows this account to sign in
-      if (!await allowSignin({ email }, emailProviderAccount)) {
-        res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
-        res.end()
-        return done()
-      }
-
-      // Verify email and token match email verification record in database
-      const invite = await getVerificationRequest(email, token, secret, provider)
+      // Verify email and verification token exist in database
+      const invite = await getVerificationRequest(email, verificationToken, secret, provider)
       if (!invite) {
         res.status(302).setHeader('Location', `${baseUrl}/error?error=Verification`)
         res.end()
         return done()
       }
 
-      // If token is valid, delete email verification record in database
-      await deleteVerificationRequest(email, token, secret, provider)
-      // Invoke callbackHandler to go through sign up flow
-      //
-      // This will create new new account if they don't have one, or sign them
-      // into an existing account if they do have one.
-      const { user, session, isNewUser } = await callbackHandler(sessionToken, { email }, emailProviderAccount, options)
+      // If verification token is valid, delete verification request token from
+      // the database so it cannot be used again
+      await deleteVerificationRequest(email, verificationToken, secret, provider)
+
+      // If is an existing user return a user object (otherwise use placeholder)
+      const profile = await getUserByEmail(email) || { email }
+      const account = { id: provider.id, type: 'email', providerAccountId: email }
+
+      // Check if user is allowed to sign in
+      const signinCallbackResponse = await callbacks.signin(profile, account, null)
+
+      if (signinCallbackResponse === false) {
+        res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
+        res.end()
+        return done()
+      }
+
+      // Sign user in
+      const { user, session, isNewUser } = await callbackHandler(sessionToken, profile, account, options)
 
       if (useJwtSession) {
-        const jwtPayload = await jwt.set({
-          user,
-          account: emailProviderAccount,
-          isNewUser
-        })
+        const defaultJwtPayload = { user, account, isNewUser }
+        const jwtPayload = await callbacks.jwt(defaultJwtPayload)
 
         // Sign and encrypt token
-        const token = await jwt.encode({ secret: jwt.secret, token: jwtPayload, maxAge: sessionMaxAge })
+        const newEncodedJwt = await jwt.encode({ secret: jwt.secret, token: jwtPayload, maxAge: sessionMaxAge })
 
         // Set cookie expiry date
         const cookieExpires = new Date()
         cookieExpires.setTime(cookieExpires.getTime() + (sessionMaxAge * 1000))
 
-        cookie.set(res, cookies.sessionToken.name, token, { expires: cookieExpires.toISOString(), ...cookies.sessionToken.options })
+        cookie.set(res, cookies.sessionToken.name, newEncodedJwt, { expires: cookieExpires.toISOString(), ...cookies.sessionToken.options })
       } else {
         // Save Session Token in cookie
         cookie.set(res, cookies.sessionToken.name, session.sessionToken, { expires: session.expires || null, ...cookies.sessionToken.options })
       }
+
+      await dispatchEvent(events.signin, { user, account, isNewUser })
 
       // Handle first logins on new accounts
       // e.g. option to send users to a new account landing page on initial login
@@ -191,6 +190,62 @@ export default async (req, res, options, done) => {
       res.end()
       return done()
     }
+  } else if (type === 'credentials' && req.method === 'POST') {
+    if (!useJwtSession) {
+      logger.error('CALLBACK_CREDENTIALS_JWT_ERROR', 'Signin in with credentials is only supported if JSON Web Tokens are enabled')
+      res.status(302).setHeader('Location', `${baseUrl}/error?error=Configuration`)
+      res.end()
+      return done()
+    }
+
+    if (!provider.authorize) {
+      logger.error('CALLBACK_CREDENTIALS_HANDLER_ERROR', 'Must define an authorize() handler to use credentials authentication provider')
+      res.status(302).setHeader('Location', `${baseUrl}/error?error=Configuration`)
+      res.end()
+      return done()
+    }
+
+    const credentials = req.body
+    const user = await provider.authorize(credentials)
+    const account = { id: provider.id, type: 'credentials' }
+
+    if (user === false) {
+      res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
+      res.end()
+      return done()
+    }
+
+    const signinCallbackResponse = await callbacks.signin(user, account, credentials)
+
+    if (signinCallbackResponse === false) {
+      res.status(302).setHeader('Location', `${baseUrl}/error?error=AccessDenied`)
+      res.end()
+      return done()
+    }
+
+    const defaultJwtPayload = { user, account }
+    const jwtPayload = await callbacks.jwt(defaultJwtPayload)
+
+    // Sign and encrypt token
+    const newEncodedJwt = await jwt.encode({ secret: jwt.secret, token: jwtPayload, maxAge: sessionMaxAge })
+
+    // Set cookie expiry date
+    const cookieExpires = new Date()
+    cookieExpires.setTime(cookieExpires.getTime() + (sessionMaxAge * 1000))
+
+    cookie.set(res, cookies.sessionToken.name, newEncodedJwt, { expires: cookieExpires.toISOString(), ...cookies.sessionToken.options })
+
+    await dispatchEvent(events.signin, { user, account })
+
+    if (callbackUrl) {
+      res.status(302).setHeader('Location', callbackUrl)
+      res.end()
+    } else {
+      res.status(302).setHeader('Location', site)
+      res.end()
+    }
+
+    return done()
   } else {
     res.status(500).end(`Error: Callback for provider type ${type} not supported`)
     return done()

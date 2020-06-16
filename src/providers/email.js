@@ -16,13 +16,13 @@ export default (options) => {
       }
     },
     from: 'NextAuth <no-reply@example.com>',
-    maxAge: 24 * 60 * 60, // How long email links should be valid for
+    maxAge: 24 * 60 * 60, // How long email links are valid for (default 24h)
     sendVerificationRequest,
     ...options
   }
 }
 
-const sendVerificationRequest = ({ identifer: emailAddress, url, token, site, provider }) => {
+const sendVerificationRequest = ({ identifier: emailAddress, url, token, site, provider }) => {
   return new Promise((resolve, reject) => {
     const { server, from } = provider
     const siteName = site.replace(/^https?:\/\//, '')

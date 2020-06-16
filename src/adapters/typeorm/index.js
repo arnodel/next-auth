@@ -1,123 +1,40 @@
-import { createConnection, getConnection, getManager, EntitySchema } from 'typeorm'
+import { createConnection, getConnection, getManager } from 'typeorm'
 import { createHash } from 'crypto'
 
 import { CreateUserError } from '../../lib/errors'
+import adapterConfig from './lib/config'
+import adapterTransform from './lib/transform'
 import Models from './models'
 import logger from '../../lib/logger'
 
-const Adapter = (config, options = {}) => {
-  // If the input is URL string, automatically convert the string to an object
-  // to make configuration easier (in most use cases).
-  //
-  // TypeORM accepts connection string as a 'url' option, but unfortunately
-  // not for all databases (e.g. SQLite) so we handle it ourselves.
-  //
-  // @TODO Move this into a function (e.g. lib/parse-database-url)
-  if (typeof config === 'string') {
-    try {
-      const parsedUrl = new URL(config)
-      config = {}
-      config.type = parsedUrl.protocol.replace(/:$/, '')
-      config.host = parsedUrl.hostname
-      config.port = Number(parsedUrl.port)
-      config.username = parsedUrl.username
-      config.password = parsedUrl.password
-      config.database = parsedUrl.pathname.replace(/^\//, '')
+const Adapter = (typeOrmConfig, options = {}) => {
+  // Ensure typeOrmConfigObject is normalized to an object
+  const typeOrmConfigObject = (typeof typeOrmConfig === 'string')
+    ? adapterConfig.parseConnectionString(typeOrmConfig)
+    : typeOrmConfig
 
-      if (parsedUrl.search) {
-        parsedUrl.search.replace(/^\?/, '').split('&').forEach(keyValuePair => {
-          let [key, value] = keyValuePair.split('=')
-          // Converts true/false strings to actual boolean values
-          if (value === 'true') { value = true }
-          if (value === 'false') { value = false }
-          config[key] = value
-        })
-      }
-    } catch (error) {
-      // If URL parsing fails for any reason, try letting TypeORM handle it
-      config = {
-        url: config
-      }
-    }
+  // Load any custom models passed as an option, default to built in models
+  const { models: customModels = {} } = options
+  const models = {
+    User: customModels.User ? customModels.User : Models.User,
+    Account: customModels.Account ? customModels.Account : Models.Account,
+    Session: customModels.Session ? customModels.Session : Models.Session,
+    VerificationRequest: customModels.VerificationRequest ? customModels.VerificationRequest : Models.VerificationRequest
   }
 
-  // Load models / schemas (check for custom models / schemas first)
-  const User = options.User ? options.User.model : Models.User.model
-  const UserSchema = options.User ? options.User.schema : Models.User.schema
+  // The models are designed for ANSI SQL databases first (as a baseline).
+  // For databases that use a different pragma, we transform the models at run
+  // time *unless* the models are user supplied (in which case we don't do
+  // anything to do them). This function updates arguments by reference.
+  adapterTransform(typeOrmConfigObject, models, options)
 
-  const Account = options.Account ? options.Account.model : Models.Account.model
-  const AccountSchema = options.Account ? options.Account.schema : Models.Account.schema
+  const config = adapterConfig.loadConfig(typeOrmConfigObject, { models, ...options })
 
-  const Session = options.Session ? options.Session.model : Models.Session.model
-  const SessionSchema = options.Session ? options.Session.schema : Models.Session.schema
-
-  const VerificationRequest = options.VerificationRequest ? options.VerificationRequest.model : Models.VerificationRequest.model
-  const VerificationRequestSchema = options.VerificationRequest ? options.VerificationRequest.schema : Models.VerificationRequest.schema
-
-  // Models default to being suitable for ANSI SQL database
-  // Some flexiblity is required to support non-SQL databases
-  let idKey = 'id'
-
-  // Some custom logic is required to make schemas compatible with MongoDB
-  // Here we monkey patch some properties if MongoDB is being used.
-  if (config.type === 'mongodb') {
-    // Important!
-    //
-    // 1. You must set 'objectId: true' on one property on a model.
-    //
-    //   'objectId' MUST be set on the primary ID field. This overrides other
-    //   values on that object in TypeORM (e.g. type: 'int' or 'primary').
-    //
-    // 2. Other properties that are Object IDs in the same model MUST be set to
-    //    type: 'objectId'
-    //
-    //    If you set 'objectId: true' on multiple properties on a model you will
-    //    see the result of queries like find() is wrong. You will see the same
-    //    Object ID in every property of type Object ID in the result (but the
-    //    database will look fine). Use type = 'objectId' for them instead!
-    //
-    // @TODO Look at refactoring to see if there is a better way to do this that
-    // doesn't rely on hard coding this transformation on a per property basis
-    UserSchema.columns.id.objectId = true
-    AccountSchema.columns.id.objectId = true
-    AccountSchema.columns.userId.type = 'objectId'
-    SessionSchema.columns.id.objectId = true
-    SessionSchema.columns.userId.type = 'objectId'
-    VerificationRequestSchema.columns.id.objectId = true
-  }
-
-  // SQLite does not support `timestamp` fields so we remap them to `datetime`
-  // NB: `timestamp` is an ANSI SQL specification and widely supported elsewhere
-  //
-  // @TODO Refactor to apply automatically to all `timestamp` properties if the
-  // database is MySQL.
-  if (config.type === 'sqlite') {
-    UserSchema.columns.created.type = 'datetime'
-    AccountSchema.columns.accessTokenExpires.type = 'datetime'
-    AccountSchema.columns.created.type = 'datetime'
-    SessionSchema.columns.expires.type = 'datetime'
-    SessionSchema.columns.created.type = 'datetime'
-    VerificationRequestSchema.columns.expires.type = 'datetime'
-    VerificationRequestSchema.columns.created.type = 'datetime'
-  }
-
-  // Parse config (uses options)
-  const defaultConfig = {
-    name: 'default',
-    autoLoadEntities: true,
-    entities: [
-      new EntitySchema(UserSchema),
-      new EntitySchema(AccountSchema),
-      new EntitySchema(SessionSchema),
-      new EntitySchema(VerificationRequestSchema)
-    ],
-    logging: false
-  }
-
-  config = {
-    ...defaultConfig,
-    ...config
-  }
+  // Create objects from models that can be consumed by functions in the adapter
+  const User = models.User.model
+  const Account = models.Account.model
+  const Session = models.Session.model
+  const VerificationRequest = models.VerificationRequest.model
 
   let connection = null
 
@@ -152,28 +69,45 @@ const Adapter = (config, options = {}) => {
 
     // Display debug output if debug option enabled
     // @TODO Refactor logger so is passed in appOptions
-    function _debug (debugCode, ...args) {
-      if (appOptions.debug) {
-        logger.debug(debugCode, ...args)
+    function debugMessage (debugCode, ...args) {
+      if (appOptions && appOptions.debug) {
+        logger.debug(`TYPEORM_${debugCode}`, ...args)
       }
     }
 
-    let ObjectId // Only defined if the database is MongoDB
+    // The models are primarily designed for ANSI SQL database, but some
+    // flexiblity is required in the adapter to support non-SQL databases such
+    // as MongoDB which have different pragmas.
+    //
+    // TypeORM does some abstraction, but doesn't handle everything (e.g. it
+    // handles translating `id` and `_id` in models, but not queries) so we
+    // need to handle somethings in the adapter to make it compatible.
+    let idKey = 'id'
+    let ObjectId
     if (config.type === 'mongodb') {
-      // MongoDB uses _id (rather than id) for primary keys and TypeORM does not
-      // fully abstract this (e.g. the way Mongoose does), so we need to do it.
-      // Note: We don't need to change the values in the schemas, just in queries
-      // that we make, so it's a variable here.
       idKey = '_id'
       const mongodb = await import('mongodb')
       ObjectId = mongodb.ObjectId
     }
 
-    const sessionMaxAge = appOptions.session.maxAge * 1000
-    const sessionUpdateAge = appOptions.session.updateAge * 1000
+    // These values are stored as seconds, but to use them with dates in
+    // JavaScript we convert them to milliseconds.
+    //
+    // Use a conditional to default to 30 day session age if not set - it should
+    // always be set but a meaningful fallback is helpful to facilitate testing.
+    if (appOptions && (!appOptions.session || !appOptions.session.maxAge)) {
+      debugMessage('GET_ADAPTER', 'Session expiry not configured (defaulting to 30 days')
+    }
+    const defaultSessionMaxAge = 30 * 24 * 60 * 60 * 1000
+    const sessionMaxAge = (appOptions && appOptions.session && appOptions.session.maxAge)
+      ? appOptions.session.maxAge * 1000
+      : defaultSessionMaxAge
+    const sessionUpdateAge = (appOptions && appOptions.session && appOptions.session.updateAge)
+      ? appOptions.session.updateAge * 1000
+      : 0
 
     async function createUser (profile) {
-      _debug('createUser', profile)
+      debugMessage('CREATE_USER', profile)
       try {
         // Create user account
         const user = new User(profile.name, profile.email, profile.image)
@@ -185,7 +119,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function getUser (id) {
-      _debug('getUser', id)
+      debugMessage('GET_USER', id)
 
       // In the very specific case of both using JWT for storing session data
       // and using MongoDB to store user data, the ID is a string rather than
@@ -206,8 +140,9 @@ const Adapter = (config, options = {}) => {
     }
 
     async function getUserByEmail (email) {
-      _debug('getUserByEmail', email)
+      debugMessage('GET_USER_BY_EMAIL', email)
       try {
+        if (!email) { return Promise.resolve(null) }
         return connection.getRepository(User).findOne({ email })
       } catch (error) {
         logger.error('GET_USER_BY_EMAIL_ERROR', error)
@@ -216,7 +151,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function getUserByProviderAccountId (providerId, providerAccountId) {
-      _debug('getUserByProviderAccountId', providerId, providerAccountId)
+      debugMessage('GET_USER_BY_PROVIDER_ACCOUNT_ID', providerId, providerAccountId)
       try {
         const account = await connection.getRepository(Account).findOne({ providerId, providerAccountId })
         if (!account) { return null }
@@ -228,25 +163,25 @@ const Adapter = (config, options = {}) => {
     }
 
     async function getUserByCredentials (credentials) {
-      _debug('getUserByCredentials', credentials)
+      debugMessage('GET_USER_BY_CREDENTIALS', credentials)
       // @TODO Get user from DB
       return false
     }
 
     async function updateUser (user) {
-      _debug('updateUser', user)
+      debugMessage('UPDATE_USER', user)
       // @TODO Save changes to user object in DB
       return false
     }
 
     async function deleteUser (userId) {
-      _debug('deleteUser', userId)
+      debugMessage('DELETE_USER', userId)
       // @TODO Delete user from DB
       return false
     }
 
     async function linkAccount (userId, providerId, providerType, providerAccountId, refreshToken, accessToken, accessTokenExpires) {
-      _debug('linkAccount', userId, providerId, providerType, providerAccountId, refreshToken, accessToken, accessTokenExpires)
+      debugMessage('LINK_ACCOUNT', userId, providerId, providerType, providerAccountId, refreshToken, accessToken, accessTokenExpires)
       try {
         // Create provider account linked to user
         const account = new Account(userId, providerId, providerType, providerAccountId, refreshToken, accessToken, accessTokenExpires)
@@ -258,7 +193,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function unlinkAccount (userId, providerId, providerAccountId) {
-      _debug('unlinkAccount', userId, providerId, providerAccountId)
+      debugMessage('UNLINK_ACCOUNT', userId, providerId, providerAccountId)
       // @TODO Get current user from DB
       // @TODO Delete [provider] object from user object
       // @TODO Save changes to user object in DB
@@ -266,7 +201,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function createSession (user) {
-      _debug('createSession', user)
+      debugMessage('CREATE_SESSION', user)
       try {
         let expires = null
         if (sessionMaxAge) {
@@ -285,7 +220,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function getSession (sessionToken) {
-      _debug('getSession', sessionToken)
+      debugMessage('GET_SESSION', sessionToken)
       try {
         const session = await connection.getRepository(Session).findOne({ sessionToken })
 
@@ -303,7 +238,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function updateSession (session, force) {
-      _debug('updateSession', session)
+      debugMessage('UPDATE_SESSION', session)
       try {
         if (sessionMaxAge && (sessionUpdateAge || sessionUpdateAge === 0) && session.expires) {
           // Calculate last updated date, to throttle write updates to database
@@ -339,7 +274,7 @@ const Adapter = (config, options = {}) => {
     }
 
     async function deleteSession (sessionToken) {
-      _debug('deleteSession', sessionToken)
+      debugMessage('DELETE_SESSION', sessionToken)
       try {
         return await connection.getRepository(Session).delete({ sessionToken })
       } catch (error) {
@@ -348,8 +283,8 @@ const Adapter = (config, options = {}) => {
       }
     }
 
-    async function createVerificationRequest (identifer, url, token, secret, provider) {
-      _debug('createVerificationRequest', identifer)
+    async function createVerificationRequest (identifier, url, token, secret, provider) {
+      debugMessage('CREATE_VERIFICATION_REQUEST', identifier)
       try {
         const { site } = appOptions
         const { sendVerificationRequest, maxAge } = provider
@@ -367,12 +302,12 @@ const Adapter = (config, options = {}) => {
         }
 
         // Save to database
-        const newVerificationRequest = new VerificationRequest(identifer, hashedToken, expires)
+        const newVerificationRequest = new VerificationRequest(identifier, hashedToken, expires)
         const verificationRequest = await getManager().save(newVerificationRequest)
 
         // With the verificationCallback on a provider, you can send an email, or queue
         // an email to be sent, or perform some other action (e.g. send a text message)
-        await sendVerificationRequest({ identifer, url, token, site, provider })
+        await sendVerificationRequest({ identifier, url, token, site, provider })
 
         return verificationRequest
       } catch (error) {
@@ -381,13 +316,13 @@ const Adapter = (config, options = {}) => {
       }
     }
 
-    async function getVerificationRequest (identifer, token, secret, provider) {
-      _debug('getVerificationRequest', identifer, token)
+    async function getVerificationRequest (identifier, token, secret, provider) {
+      debugMessage('GET_VERIFICATION_REQUEST', identifier, token)
       try {
         // Hash token provided with secret before trying to match it with datbase
-        // @TODO Use bcrypt function here instead of simple salted hash
+        // @TODO Use bcrypt instead of salted SHA-256 hash for token
         const hashedToken = createHash('sha256').update(`${token}${secret}`).digest('hex')
-        const verificationRequest = await connection.getRepository(VerificationRequest).findOne({ identifer, token: hashedToken })
+        const verificationRequest = await connection.getRepository(VerificationRequest).findOne({ identifier, token: hashedToken })
 
         if (verificationRequest && verificationRequest.expires && new Date() > new Date(verificationRequest.expires)) {
           // Delete verification entry so it cannot be used again
@@ -402,8 +337,8 @@ const Adapter = (config, options = {}) => {
       }
     }
 
-    async function deleteVerificationRequest (identifer, token, secret, provider) {
-      _debug('deleteVerification', identifer, token)
+    async function deleteVerificationRequest (identifier, token, secret, provider) {
+      debugMessage('DELETE_VERIFICATION', identifier, token)
       try {
         // Delete verification entry so it cannot be used again
         const hashedToken = createHash('sha256').update(`${token}${secret}`).digest('hex')
