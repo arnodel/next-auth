@@ -1,5 +1,5 @@
 // Minimum TypeScript Version: 3.8
-// declare module "next-auth/client" {
+
 export function useSession(): [SessionData, boolean];
 export function getSession({ req }?: { req: any }): Promise<SessionData | null>;
 
@@ -14,4 +14,3 @@ export interface User {
   email: string | null;
   image: string | null;
 }
-// }
