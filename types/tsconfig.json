@@ -6,6 +6,6 @@
     "noEmit": true,
     "baseUrl": ".",
     "esModuleInterop": true,
-    "paths": { "next-auth": ["."] }
+    "paths": { "next-auth": ["."], "next-auth/*": ["./*"] }
   }
 }
